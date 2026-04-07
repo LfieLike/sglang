@@ -252,10 +252,10 @@ class ExtendedRadixCache(BasePrefixCache):
             return True
         return self._connector.check_prefetch_completed(req.rid)
 
-    def release_aborted_request(self, req: Req) -> None:
+    def release_aborted_request(self, rid: str) -> None:
         if self._connector is None:
             return
-        self._connector.cancel_prefetch(req.rid)
+        self._connector.cancel_prefetch(rid)
 
     # -- Private helpers --
 
