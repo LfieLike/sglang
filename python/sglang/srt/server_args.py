@@ -567,6 +567,10 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
+    # External KV connector (KV-cache offloading)
+    kv_connector_cls: Optional[str] = None
+    kv_connector_extra_config: Optional[str] = None
+
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
     kt_method: Optional[str] = None
@@ -3324,6 +3328,18 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.kv_connector_cls is not None:
+            if self.disable_radix_cache:
+                raise ValueError(
+                    "The arguments kv-connector-cls and disable-radix-cache are mutually exclusive "
+                    "because ExtendedRadixCache requires radix cache enabled."
+                )
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "The arguments kv-connector-cls and enable-hierarchical-cache are mutually exclusive. "
+                    "Please use only one of them."
+                )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -3486,6 +3502,12 @@ class ServerArgs:
                     "LMCache is disabled because of using diffusion LLM inference"
                 )
                 self.enable_lmcache = False
+
+            if self.kv_connector_cls is not None:
+                logger.warning(
+                    "KVConnector is disabled because of using diffusion LLM inference"
+                )
+                self.kv_connector_cls = None
 
         if not self.pp_size > 1:
             logger.warning(
@@ -5117,6 +5139,23 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+
+        # KVConnector
+        parser.add_argument(
+            "--kv-connector-cls",
+            type=str,
+            default=ServerArgs.kv_connector_cls,
+            help="The full Python class path for the external KV connector "
+            "(e.g., 'my_module.MyConnector'). The class must inherit from "
+            "sglang.srt.mem_cache.kv_connector.BaseKVConnector.",
+        )
+        parser.add_argument(
+            "--kv-connector-extra-config",
+            type=str,
+            default=ServerArgs.kv_connector_extra_config,
+            help="A dictionary in JSON string format containing extra configuration "
+            "for the external KV connector.",
         )
 
         # Ktransformer server args

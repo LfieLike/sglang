@@ -1090,7 +1090,7 @@ class HiRadixCache(RadixCache):
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
-    def check_hicache_events(self):
+    def check_kv_events(self):
         self.writing_check()
         self.loading_check()
         if self.enable_storage:

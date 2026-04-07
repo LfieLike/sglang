@@ -908,6 +908,7 @@ class Req(ReqDllmMixin):
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                     req=self,
                     cow_mamba=cow_mamba,
+                    update_connector_state=True,
                 )
             )
             (
