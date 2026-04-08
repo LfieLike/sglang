@@ -279,7 +279,7 @@ class FlexKVConnector(BaseKVConnector):
 
         self.num_layers = model_config.num_hidden_layers if model_config else 0
         self.enable_layerwise_transfer = bool(
-            int(os.getenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "1"))
+            int(os.getenv("FLEXKV_ENABLE_LAYERWISE_TRANSFER", "0"))
         )
         self.layerwise_eventfd_socket = os.getenv(
             "FLEXKV_LAYERWISE_EVENTFD_SOCKET", "/tmp/flexkv_layerwise_eventfd.sock"
