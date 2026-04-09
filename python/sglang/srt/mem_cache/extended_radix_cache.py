@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.kv_connector import BaseKVConnector, LoadOperation
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode, page_align_keys
 from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -122,6 +122,17 @@ class ExtendedRadixCache(BasePrefixCache):
             update_state_for_load=params.update_connector_state,
             rid=params.req.rid if params.req is not None else None,
         )
+
+        # Page-align host_hit_length: ensure GET loads complete pages
+        if new_hit_length > 0 and self.page_size > 1:
+            aligned_hit = (new_hit_length // self.page_size) * self.page_size
+            if aligned_hit < new_hit_length:
+                logger.debug(
+                    "[ExtendedRadixCache] match_prefix: host_hit_length page_align %d -> %d (page_size=%d)",
+                    new_hit_length, aligned_hit, self.page_size,
+                )
+                new_hit_length = aligned_hit
+
         if params.req is not None:
             params.req.cached_tokens_extended_device = new_hit_length
 
@@ -212,13 +223,21 @@ class ExtendedRadixCache(BasePrefixCache):
         return task_id
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+        # Save kv_committed_len before super() pops it (pop_committed_kv_cache
+        # sets kv_committed_freed=True and cannot be called again).
+        kv_committed_len = req.kv_committed_len
+
         self._inner_radixtree.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
         if self._connector is None or not is_insert:
             return
 
         req_id = req.req_pool_idx
-        token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        # Reuse sglang's page_align_keys to truncate to page boundary
+        token_ids = page_align_keys(token_ids, self.page_size)
+        if len(token_ids) == 0:
+            return
         kv_indices = self._inner_radixtree.req_to_token_pool.req_to_token[
             req_id, : len(token_ids)
         ]
