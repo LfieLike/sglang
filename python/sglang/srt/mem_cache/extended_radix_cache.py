@@ -123,16 +123,6 @@ class ExtendedRadixCache(BasePrefixCache):
             rid=params.req.rid if params.req is not None else None,
         )
 
-        # Page-align host_hit_length: ensure GET loads complete pages
-        if new_hit_length > 0 and self.page_size > 1:
-            aligned_hit = (new_hit_length // self.page_size) * self.page_size
-            if aligned_hit < new_hit_length:
-                logger.debug(
-                    "[ExtendedRadixCache] match_prefix: host_hit_length page_align %d -> %d (page_size=%d)",
-                    new_hit_length, aligned_hit, self.page_size,
-                )
-                new_hit_length = aligned_hit
-
         if params.req is not None:
             params.req.cached_tokens_extended_device = new_hit_length
 
