@@ -283,7 +283,8 @@ class FlexKVConnector(BaseKVConnector):
             dp_size=dp_size,
             dp_rank=dp_rank,
             cp_size=cp_size,
-            cp_rank=cp_rank
+            cp_rank=cp_rank,
+            nsa_prefill_cp=server_args.enable_nsa_prefill_context_parallel
         )
 
         self.tp_size = server_args.tp_size
