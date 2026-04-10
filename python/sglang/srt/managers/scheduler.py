@@ -813,6 +813,8 @@ class Scheduler(
                     server_args=server_args,
                     tp_group=self.tp_group,
                     tp_rank=self.tp_rank,
+                    cp_group=self.attn_cp_group,
+                    cp_rank=self.attn_cp_rank,
                     kvcache=params.token_to_kv_pool_allocator.get_kvcache(),
                 )
                 self.tree_cache = ExtendedRadixCache(params=params, connector=connector)

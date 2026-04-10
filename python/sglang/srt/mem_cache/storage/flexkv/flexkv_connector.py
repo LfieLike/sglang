@@ -246,12 +246,15 @@ class FlexKVConnector(BaseKVConnector):
         server_args: Any = None,
         tp_group: Any = None,
         tp_rank: int = 0,
+        cp_group: Any = None,
+        cp_rank: int = 0,
         kvcache: Any = None,
     ):
-        super().__init__(params, server_args, tp_group, tp_rank, kvcache)
+        super().__init__(params, server_args, tp_group, tp_rank, cp_group, cp_rank, kvcache)
 
         model_config = ModelConfig.from_server_args(server_args)
 
+        cp_size = server_args.attn_cp_size if server_args.attn_cp_size > 0 else 1
         pp_size = server_args.pp_size if server_args.pp_size > 0 else 1
         pp_rank = getattr(server_args, "_pp_rank", 0)
         # Normalise None to safe defaults (PP-only mode may pass None)
@@ -279,19 +282,30 @@ class FlexKVConnector(BaseKVConnector):
             pp_rank=pp_rank,
             dp_size=dp_size,
             dp_rank=dp_rank,
+            cp_size=cp_size,
+            cp_rank=cp_rank
         )
 
         self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
         self.tp_cpu_group = getattr(tp_group, "cpu_group", tp_group) if tp_group is not None else None
+        self.cp_size = cp_size
+        # self.cp_rank already set by base connector class
+        self.cp_cpu_group = getattr(cp_group, "cpu_group", cp_group) if cp_group is not None else None
         self.page_size = params.page_size
 
-        # Compute global_rank and tp_src_rank for correct broadcast in PP scenarios
+        # INFO: self.rank answers "who am I in my TP/CP group" (local)?
+        #       self.src_rank answers "what is the global rank of the group leader" (used as the broadcast source)?
+        #       self.global_rank answers "who am I in the world" (global)?
+        self.rank = self.cp_rank if cp_size > 1 else self.tp_rank # WARN: Either CP or TP under a DP group, not both
+        # Compute global_rank and src_rank for correct broadcast in PP scenarios
         self.global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        if self.tp_cpu_group is not None and self.tp_size > 1:
-            self.tp_src_rank = torch.distributed.get_global_rank(self.tp_cpu_group, 0)
+        if cp_size > 1:
+            self.src_rank = torch.distributed.get_global_rank(self.cp_cpu_group, 0)
+        elif self.tp_cpu_group is not None and self.tp_size > 1:
+            self.src_rank = torch.distributed.get_global_rank(self.tp_cpu_group, 0)
         else:
-            self.tp_src_rank = 0
+            self.src_rank = 0        
 
         # Build unified kv_caches list (MLA vs MHA)
         indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
@@ -316,7 +330,9 @@ class FlexKVConnector(BaseKVConnector):
 
         # Build rank label for structured logging
         rank_parts = []
-        if int(self.tp_size) > 1:
+        if cp_size > 1:
+            rank_parts.append(f"cp_rank={int(cp_rank)}")
+        elif int(self.tp_size) > 1:
             rank_parts.append(f"tp_rank={int(tp_rank)}")
         if int(pp_size) > 1:
             rank_parts.append(f"pp_rank={int(pp_rank)}")
@@ -324,7 +340,7 @@ class FlexKVConnector(BaseKVConnector):
             rank_parts.append(f"dp_rank={int(dp_rank)}")
         self._rank_label = f" [{', '.join(rank_parts)}]" if rank_parts else ""
 
-        if self.tp_rank == 0:
+        if self.rank == 0:
             self.kv_manager = KVManager(
                 model_config=self.flexkv_config.model_config,
                 cache_config=self.flexkv_config.cache_config,
@@ -338,13 +354,17 @@ class FlexKVConnector(BaseKVConnector):
                 f"server_recv_port={self.flexkv_config.server_recv_port}, "
                 f"gpu_register_port={self.flexkv_config.gpu_register_port}")
 
-        # Use globally unique device_id: dp_rank * tp_size + tp_rank
+        # Use globally unique device_id: dp_rank * {cp|tp}_size + {cp|tp}_rank
         # so that GPUs from different DP ranks don't collide in TransferManager.
         # NOTE: This only works for single-node DP. Multi-node DP is not
         # considered here.
-        global_device_id = int(dp_rank) * int(self.tp_size) + int(self.tp_rank)
-        self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, int(dp_rank), global_device_id)
+        if self.cp_size > 1:
+            global_device_id = int(dp_rank) * int(self.cp_size) + int(self.cp_rank) # Either CP or TP
+        else:
+            global_device_id = int(dp_rank) * int(self.tp_size) + int(self.tp_rank)
+        self.tp_client = KVTPClient(self.flexkv_config.gpu_register_port, int(dp_rank), global_device_id) # WARN: Reuse TP client for CP
         logger.info(
+            (f"[FlexKV] Use KVTPClient on behalf of CP\n" if self.cp_size > 1 else "") +
             f"[FlexKV] KVTPClient created{self._rank_label}: "
             f"gpu_register_port={self.flexkv_config.gpu_register_port}")
         self._register_to_server(kv_caches, indexer_buffers)
@@ -402,7 +422,7 @@ class FlexKVConnector(BaseKVConnector):
         # flexkv task ids for periodic drain to prevent pipe deadlock
         self._load_fkv_tids: List[int] = []
 
-        if self.tp_rank == 0:
+        if self.rank == 0:
             wait_count = 0
             while not self.kv_manager.is_ready():
                 time.sleep(10)
@@ -457,7 +477,10 @@ class FlexKVConnector(BaseKVConnector):
         hit_length = 0
         flexkv_task_id = -1
 
-        if self.tp_rank == 0:
+        # INFO: TP/CP group is strictly synchronous, so TP/CP ranks are symmetric. This means they
+        #       have identical dst GPU blocks. Hence, let TP/CP rank 0 do prefix matching on the
+        #       TP/CP group's behalf and broadcast the result to the rest of the group.
+        if self.rank == 0:
             token_ids_np = np.array(token_ids, dtype=np.int64)
             flexkv_task_id, matched_mask = self.kv_manager.get_match(
                 token_ids=token_ids_np,
@@ -467,12 +490,21 @@ class FlexKVConnector(BaseKVConnector):
             if not update_state_for_load:
                 self.kv_manager.cancel([flexkv_task_id])
 
-        if self.tp_cpu_group is not None and self.tp_size > 1:
+        if self.cp_cpu_group is not None and self.cp_size > 1:
+            data = broadcast_pyobj(
+                [{"hit_length": hit_length, "task_id": flexkv_task_id}],
+                self.global_rank,
+                self.cp_cpu_group,
+                src=self.src_rank
+            )[0]
+            hit_length = data['hit_length']
+            flexkv_task_id = data['task_id']
+        elif self.tp_cpu_group is not None and self.tp_size > 1:
             data = broadcast_pyobj(
                 [{"hit_length": hit_length, "task_id": flexkv_task_id}],
                 self.global_rank,
                 self.tp_cpu_group,
-                src=self.tp_src_rank,
+                src=self.src_rank,
             )[0]
             hit_length = data["hit_length"]
             flexkv_task_id = data["task_id"]
@@ -521,7 +553,7 @@ class FlexKVConnector(BaseKVConnector):
             self._layer_done_counter.events[producer_id].reset_for_new_transfer()
             self._layer_done_counter.register_task(task_id, producer_id)
 
-            if self.tp_rank == 0:
+            if self.rank == 0:
                 self.kv_manager.launch(
                     task_ids=flexkv_task_ids,
                     slot_mappings=slot_mappings,
@@ -530,11 +562,11 @@ class FlexKVConnector(BaseKVConnector):
                     counter_id=producer_id,
                 )
 
-            if self.tp_rank == 0:
+            if self.rank == 0:
                 self._load_fkv_tids.extend(flexkv_task_ids)
             self._ongoing_loads[task_id] = producer_id
         else:
-            if self.tp_rank == 0:
+            if self.rank == 0:
                 self.kv_manager.launch(
                     task_ids=flexkv_task_ids,
                     slot_mappings=slot_mappings,
@@ -550,13 +582,15 @@ class FlexKVConnector(BaseKVConnector):
                         "[FlexKV] Some tasks failed in non-layerwise transfer"
                     )
 
-            if self.tp_cpu_group is not None and self.tp_size > 1:
+            if self.cp_cpu_group is not None and self.cp_size > 1:
+                torch.distributed.barrier(self.cp_cpu_group)
+            elif self.tp_cpu_group is not None and self.tp_size > 1:
                 torch.distributed.barrier(self.tp_cpu_group)
 
             self._completed_loads.append(task_id)
 
     def check_completed_load_tasks(self) -> List[int]:
-        if self.tp_rank == 0 and len(self._load_fkv_tids) >= 100:
+        if self.rank == 0 and len(self._load_fkv_tids) >= 100:
             self.kv_manager.try_wait(task_ids=self._load_fkv_tids)
             self._load_fkv_tids.clear()
 
@@ -575,7 +609,7 @@ class FlexKVConnector(BaseKVConnector):
         token_ids: List[int],
         kv_indices: torch.Tensor,
     ) -> None:
-        if self.tp_rank != 0:
+        if self.rank != 0:
             return
 
         try:
@@ -622,7 +656,7 @@ class FlexKVConnector(BaseKVConnector):
         completed_ext_ids = list(self._completed_stores)
         self._completed_stores.clear()
 
-        if self.tp_rank == 0 and self._ongoing_stores:
+        if self.rank == 0 and self._ongoing_stores:
             fk_to_ext = {v: k for k, v in self._ongoing_stores.items()}
             completed_dict = self.kv_manager.try_wait(task_ids=list(fk_to_ext.keys()))
             for fk_tid in completed_dict:
@@ -630,12 +664,19 @@ class FlexKVConnector(BaseKVConnector):
                 completed_ext_ids.append(ext_tid)
                 del self._ongoing_stores[ext_tid]
 
-        if self.tp_cpu_group is not None and self.tp_size > 1:
+        if self.cp_cpu_group is not None and self.cp_size > 1:
             completed_ext_ids = broadcast_pyobj(
-                [completed_ext_ids] if self.tp_rank == 0 else [None],
+                [completed_ext_ids] if self.rank == 0 else [None],
+                self.global_rank,
+                self.cp_cpu_group,
+                src=self.src_rank,
+            )[0]
+        elif self.tp_cpu_group is not None and self.tp_size > 1:
+            completed_ext_ids = broadcast_pyobj(
+                [completed_ext_ids] if self.rank == 0 else [None],
                 self.global_rank,
                 self.tp_cpu_group,
-                src=self.tp_src_rank,
+                src=self.src_rank,
             )[0]
 
         return completed_ext_ids
@@ -659,7 +700,7 @@ class FlexKVConnector(BaseKVConnector):
         self._completed_loads.clear()
         self._load_fkv_tids.clear()
 
-        if self.tp_rank == 0:
+        if self.rank == 0:
             for fk_tid in list(self._ongoing_stores.values()):
                 if fk_tid >= 0:
                     self._wait_flexkv_task(fk_tid)
@@ -670,13 +711,13 @@ class FlexKVConnector(BaseKVConnector):
             self._layer_done_counter.reset()
 
     def shutdown(self) -> None:
-        if self.tp_rank == 0:
+        if self.rank == 0:
             self.kv_manager.shutdown()
 
     # ---- Private helpers ----
 
     def _wait_flexkv_task(self, fk_task_id: int, timeout: float = 20.0) -> bool:
-        if fk_task_id < 0 or self.tp_rank != 0:
+        if fk_task_id < 0 or self.rank != 0:
             return True
         try:
             response = self.kv_manager.wait([fk_task_id], timeout=timeout)
@@ -826,12 +867,12 @@ class FlexKVConnector(BaseKVConnector):
         try:
             num_counters = self._layer_done_counter.num_counters
             metadata = struct.pack(
-                "iiii", self.tp_rank, self.tp_size, self.num_layers, num_counters
+                "iiiiii", self.tp_rank, self.tp_size, self.cp_rank, self.cp_size, self.num_layers, num_counters
             )
             sock.sendall(metadata)
             logger.debug(
                 f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
-                f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, "
+                f"tp_rank={self.tp_rank}, tp_size={self.tp_size}, cp_rank={self.cp_rank}, cp_size={self.cp_size}, "
                 f"num_layers={self.num_layers}, num_counters={num_counters}")
 
             for counter_id in range(num_counters):
