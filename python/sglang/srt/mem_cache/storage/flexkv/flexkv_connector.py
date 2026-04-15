@@ -140,21 +140,17 @@ class FlexKVLayerLoadingEvent:
             eventfd(0, EFD_SEMAPHORE) for _ in range(num_layers)
         ]
         self._finished = True
-        self._last_layer_wait_count = 0
         self.wait_remaining: List[int] = [1] * num_layers
 
     def reset_for_new_transfer(self):
         self._finished = False
-        self._last_layer_wait_count = 0
         self.wait_remaining = [1] * self._num_layers
 
     def wait(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         eventfd_read(self.load_event_fds[layer_index])
         if layer_index == self._num_layers - 1:
-            self._last_layer_wait_count += 1
-            if self._last_layer_wait_count >= 2:
-                self._finished = True
+            self._finished = True
 
     def close(self):
         for fd in self.load_event_fds:
@@ -558,10 +554,7 @@ class FlexKVConnector(BaseKVConnector):
             self._layer_done_counter.events[producer_id].reset_for_new_transfer()
             self._layer_done_counter.register_task(task_id, producer_id)
 
-            logger.info(f"[FlexKV {self._rank_label}] Launching layerwise transfer with {len(flexkv_task_ids)} tasks, task_id: {task_id}, producer_id: {producer_id}")
-
             if self.rank == 0:
-                logger.info(f"[FlexKV {self._rank_label}] Launching exklayerwise transfer with {len(flexkv_task_ids)} tasks")
                 self.kv_manager.launch(
                     task_ids=flexkv_task_ids,
                     slot_mappings=slot_mappings,
