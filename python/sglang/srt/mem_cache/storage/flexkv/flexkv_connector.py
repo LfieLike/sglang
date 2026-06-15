@@ -217,6 +217,7 @@ class FlexKVConnector(BaseKVConnector):
             self.flexkv_config.gpu_register_port,
             dp_client_id=self.dp_client_id,
             pp_rank=self.pp_rank,
+            pp_start_layer=rank_info.pp_start_layer,
             device_id=rank_info.local_rank,
         )
 
@@ -265,11 +266,16 @@ class FlexKVConnector(BaseKVConnector):
         self._load_fkv_tids: List[int] = []
         # rid -> flexkv_task_id (prefetch in flight)
         self._ongoing_prefetches: Dict[str, int] = {}
-        self._prefetch_enabled = bool(
+
+        self._prefetch_token_counts: Dict[str, int] = {}
+        self._prefetch_loaded_tokens: Dict[str, int] = {}
+
+        has_external_storage = bool(
             cache_config.enable_ssd
             or cache_config.enable_remote
             or cache_config.enable_kv_sharing
         )
+        self._prefetch_enabled = bool(int(os.getenv("FLEXKV_PREFETCH_ENABLE", "0"))) and has_external_storage
 
         if self._sync_ctx.is_sync_leader:
             wait_count = 0
@@ -330,6 +336,7 @@ class FlexKVConnector(BaseKVConnector):
     ) -> int:
         hit_length = 0
         flexkv_task_id = -1
+            
 
         # INFO: TP/CP group is strictly synchronous, so TP/CP ranks are symmetric. This means they
         #       have identical dst GPU blocks. Hence, let TP/CP rank 0 do prefix matching on the
@@ -631,23 +638,31 @@ class FlexKVConnector(BaseKVConnector):
             return
         if not rid:
             return
+        # Deduplicate: skip if a prefetch for this rid is already in-flight
+        # (e.g. request was retracted and re-queued)
+        if rid in self._ongoing_prefetches:
+            logger.info(f"[FlexKV] prefetch: deduplicated for rid={rid}, skipping current prefetch")
+            return
 
         prefetch_task_id = -1
+        actual_prefetch_tokens = 0
         if self._sync_ctx.is_sync_leader:
             token_ids_np = np.array(token_ids, dtype=np.int64)
-            prefetch_task_id = self.kv_manager.prefetch_async(
+            prefetch_task_id, actual_prefetch_tokens = self.kv_manager.prefetch_async(
                 token_ids=token_ids_np,
             )
-            logger.debug(f"[FlexKV] prefetch: launched task_id={prefetch_task_id}")
+            logger.info(f"[FlexKV] prefetch: launched task_id={prefetch_task_id}, actual_prefetch_tokens={actual_prefetch_tokens}")
 
         if self._sync_ctx.needs_sync:
             data = self._sync_ctx.scatter(
-                {"task_id": prefetch_task_id},
+                {"task_id": prefetch_task_id, "actual_prefetch_tokens": actual_prefetch_tokens},
             )
             prefetch_task_id = data["task_id"]
+            actual_prefetch_tokens = data["actual_prefetch_tokens"]
 
         if prefetch_task_id >= 0:
             self._ongoing_prefetches[rid] = prefetch_task_id
+            self._prefetch_token_counts[rid] = actual_prefetch_tokens
 
     def check_prefetch_progress(self, rid: str) -> bool:
         if not self._prefetch_enabled:
@@ -658,19 +673,23 @@ class FlexKVConnector(BaseKVConnector):
             return True
 
         is_completed = False
+        loaded_tokens = 0
         if self._sync_ctx.is_sync_leader:
             completed = self.kv_manager.try_wait(task_ids=[prefetch_task_id])
             if prefetch_task_id in completed:
-                status = completed[prefetch_task_id].status
-                if status != KVResponseStatus.SUCCESS:
+                resp = completed[prefetch_task_id]
+                if resp.status != KVResponseStatus.SUCCESS:
                     logger.warning(
                         "[FlexKV] prefetch task %d for rid=%s finished with status=%s",
                         prefetch_task_id,
                         rid,
-                        status,
+                        resp.status,
                     )
                 is_completed = True
 
+                if resp.return_mask is not None:
+                    loaded_tokens =int(np.sum(resp.return_mask))
+                
         if self._sync_ctx.needs_sync:
             data = self._sync_ctx.scatter(
                 {"is_completed": is_completed, "loaded_tokens": 0},
@@ -678,8 +697,20 @@ class FlexKVConnector(BaseKVConnector):
             is_completed = data["is_completed"]
 
         if is_completed:
-            self._ongoing_prefetches.pop(rid, None)
+            self._release_prefetch(rid, loaded_tokens)
+
         return is_completed
+
+    def _release_prefetch(self, rid: str, loaded_tokens: int = 0) -> None:
+        """Clean up per-rid prefetch tracking state.
+
+        Called from check_prefetch_progress on completion, timeout, or
+        best_effort release.  Flow control (token capacity) is handled
+        entirely inside FlexKV; connector only tracks per-rid metadata.
+        """
+        self._ongoing_prefetches.pop(rid, None)
+        self._prefetch_token_counts.pop(rid, None)
+        self._prefetch_loaded_tokens[rid] = loaded_tokens
 
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
         # TODO: Implement this
