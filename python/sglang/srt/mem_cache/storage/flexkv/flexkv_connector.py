@@ -101,13 +101,15 @@ class FlexKVConnector(BaseKVConnector):
 
         # ---- Initialize FlexKV config ----
         self.flexkv_config = FlexKVConfig.from_env()
+        # NB: sglang scheduler passes dp_rank=None when dp_size==1 (see
+        # entrypoints/engine.py:_launch_scheduler_processes); 
         rank_info = self.flexkv_config.post_init_from_sglang_config(
             sglang_config=sglang_model_config,
             server_args=server_args,
             page_size=self.page_size,
             tp_rank=tp_rank,
             pp_rank=params.pp_rank,
-            dp_rank=dp_rank,
+            dp_rank=0 if dp_rank is None else int(dp_rank),
             attn_cp_rank=attn_cp_rank,
         )
 
