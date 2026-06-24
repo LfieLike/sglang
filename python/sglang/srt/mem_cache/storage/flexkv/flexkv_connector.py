@@ -101,15 +101,13 @@ class FlexKVConnector(BaseKVConnector):
 
         # ---- Initialize FlexKV config ----
         self.flexkv_config = FlexKVConfig.from_env()
-        # NB: sglang scheduler passes dp_rank=None when dp_size==1 (see
-        # entrypoints/engine.py:_launch_scheduler_processes); 
         rank_info = self.flexkv_config.post_init_from_sglang_config(
             sglang_config=sglang_model_config,
             server_args=server_args,
             page_size=self.page_size,
             tp_rank=tp_rank,
             pp_rank=params.pp_rank,
-            dp_rank=0 if dp_rank is None else int(dp_rank),
+            dp_rank=dp_rank,
             attn_cp_rank=attn_cp_rank,
         )
 
@@ -211,6 +209,11 @@ class FlexKVConnector(BaseKVConnector):
                 f"[FlexKV] Creating KVManager{self._rank_label}: "
                 f"server_recv_port={self.flexkv_config.server_recv_port}, "
                 f"gpu_register_port={self.flexkv_config.gpu_register_port}")
+
+        # CP/TP ranks must not register until sync_leader has started the
+        # TransferManager subprocess and its ZMQ PULL socket is listening.
+        if self._sync_ctx.needs_sync:
+            self._sync_ctx.barrier()
 
         # ---- GPU Registration Routing ----
         self.dp_client_id = rank_info.dp_client_id
@@ -982,24 +985,24 @@ class FlexKVConnector(BaseKVConnector):
                     )
 
                 # Phase 2: Send metadata + eventfds over the connected socket.
-                # UDS is node-local, so use _per_node TP rank/size so that
-                # LayerwiseWorker builds the correct eventfd tensor shape.
+                # Use effective_tp_rank/size so CP ranks are distinct when tp_size=1.
                 num_counters = self._layer_done_counter.num_counters
                 model_config = self.flexkv_config.model_config
                 rank_info = self.rank_info
-                # Send 16-byte metadata: tp_rank_per_node, tp_size_per_node, num_layers, num_counters
+                # Send 16-byte metadata: effective_tp_rank, effective_tp_size_per_node,
+                # num_layers, num_counters
                 metadata = struct.pack(
                     "iiii",
-                    rank_info.tp_rank_per_node,
-                    model_config.tp_size_per_node,
+                    rank_info.effective_tp_rank,
+                    model_config.effective_tp_size_per_node,
                     rank_info.num_layers_per_pp_stage,
                     num_counters,
                 )
                 sock.sendall(metadata)
                 logger.debug(
                     f"[FlexKV] Eventfd metadata sent{self._rank_label}: "
-                    f"tp_rank_per_node={rank_info.tp_rank_per_node}, "
-                    f"tp_size_per_node={model_config.tp_size_per_node}, "
+                    f"effective_tp_rank={rank_info.effective_tp_rank}, "
+                    f"effective_tp_size_per_node={model_config.effective_tp_size_per_node}, "
                     f"num_layers={rank_info.num_layers_per_pp_stage}, num_counters={num_counters}"
                 )
 
